@@ -89,6 +89,37 @@ MAX_TIMER_INTERVAL = 5.0
 # ---------------------------------------------------------------------------
 
 
+def has_orphans_in_scope(settings):
+    """True when the *enabled scope* currently holds a purgeable zero-user block.
+
+    Replicates the scope gating used by :func:`purge_groups` (active groups,
+    their mapped data attrs, and the Fake User respect flag) so detection is
+    always consistent with what a real purge would actually remove. Only ever
+    called from the watchdog tick — it only *schedules*, never purges here.
+    """
+    try:
+        groups = active_groups(settings)
+    except Exception:
+        return False
+    respect_fake_user = bool(getattr(settings, "respect_fake_user", True))
+    for group in groups:
+        for attr in PURGE_GROUPS.get(group, ()):
+            try:
+                blocks = getattr(bpy.data, attr)
+            except Exception:
+                continue
+            for block in blocks:
+                try:
+                    if block.users != 0:
+                        continue
+                    if respect_fake_user and block.use_fake_user:
+                        continue
+                except Exception:
+                    continue
+                return True
+    return False
+
+
 def active_groups(settings):
     """Return the list of scope-group keys currently enabled on Auto-Purge settings."""
     return [group for group, attr in GROUP_ATTRS.items() if getattr(settings, attr, False)]
@@ -248,6 +279,15 @@ class AutoPurgeManager:
             return
         self._schedule(settings)
 
+    def schedule_debounced(self, settings):
+        """Public, pure-scheduling wrapper used by the watchdog tick.
+
+        Runs on the timer thread (the single safe point a purge may ever be
+        scheduled from); applies the same debounce/_pending gate as the
+        object-deletion detection path, so scheduling here is never more
+        aggressive than scheduling from a deletion. Does not purge."""
+        self._schedule(settings)
+
     def _schedule(self, settings):
         if self._pending:
             return
@@ -336,6 +376,8 @@ def _poll_tick():
     settings = getattr(scene, "auto_purge", None) if scene is not None else None
     if settings is not None and getattr(settings, "enabled", False):
         manager.on_depsgraph_update(settings)
+        if has_orphans_in_scope(settings):
+            manager.schedule_debounced(settings)
         manager.purge_if_due(settings)
     return WATCHDOG_INTERVAL
 
