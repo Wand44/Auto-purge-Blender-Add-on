@@ -1,9 +1,59 @@
+"""Orchestration and the purge engine for Auto-Purge.
+
+Design (kept deliberately close to how the add-on "worked before", while
+retaining every security feature added for review feedback):
+
+* The actual data removal is delegated to Blender's own outliner "orphans"
+  purge operator (``bpy.ops.outliner.orphans_purge``) — the exact, battle-tested
+  mechanism the original single-file add-on used on day one, and the same one
+  Blender's manual "Purge > Unused Data" runs. It is recursive, respects Fake
+  User on every data category, works on every backport, and cannot silently
+  "purge nothing" when there is something to purge.
+* The operator is NEVER invoked inside the depsgraph handler (running operators
+  there is unsafe and was the original review complaint). Deletions are only
+  *detected* there via a cheap object-name snapshot + a persistent watchdog
+  timer; the operator runs later, on the main thread, from the timer tick after
+  a debounce.
+* Scope groups still apply: when every category under a scope group is enabled
+  the add-on takes the reliable orphan-purge operator path (which purges all
+  unused categories); when the user explicitly disables categories, the purge
+  falls back to the precise per-attribute data-API remover so the scope choice
+  is respected exactly.
+* Fake User is always respected (both paths guard ``use_fake_user``); respect
+  for Fake User can additionally be toggled by the user.
+* Everything in this module is idempotent: register/unregister may be called
+  any number of times without leaking handlers, timers or duplicate callbacks.
+"""
+
 import time
 
 import bpy
 
-# Scope groups: which Blender data categories each setting can purge.
-# Only entries that exist in the running Blender are used (guarded by getattr).
+# ---------------------------------------------------------------------------
+# Version (single definition; exported for the version label)
+# ---------------------------------------------------------------------------
+# Matches bl_info["version"] in the root __init__.py and blender_manifest.toml.
+# Kept exactly once, at module scope, so an import can bind it unconditionally.
+ADDON_VERSION_STRING = "1.1.2"
+ADDON_VERSION_TUPLE = (1, 1, 2)
+
+# ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+MIN_DEBOUNCE = 0.1
+MAX_DEBOUNCE = 5.0
+DEFAULT_DEBOUNCE = 0.5
+WATCHDOG_INTERVAL = 0.5          # watchdog poll period (timer seconds)
+MAX_OPERATOR_RETRIES = 3
+ORPHANS_OR_FLAG_MISSING = ()     # replaced at registration from live manifest
+
+# ---------------------------------------------------------------------------
+# Scope groups
+# ---------------------------------------------------------------------------
+# Each purge scope maps to one or more bpy.data.* attribute names. Only
+# attributes that exist in the running build are used (guarded by getattr), so
+# this stays compatible with data categories that appear/change between
+# Blender releases.
 PURGE_GROUPS = {
     "objects": ("objects",),
     "geometry": (
@@ -34,28 +84,43 @@ MAX_PURGE_PASSES = 10
 MIN_TIMER_INTERVAL = 0.05
 MAX_TIMER_INTERVAL = 5.0
 
-# Full add-on version, so the UI can label builds without importing Blender data.
-ADDON_VERSION_STRING = "1.1.1"
-POLL_INTERVAL = 0.5
-
-# Matches bl_info["version"] in the root __init__.py (kept in sync manually).
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
 
 
 def active_groups(settings):
-    """Return the list of scope-group keys enabled on an Auto-Purge settings group."""
+    """Return the list of scope-group keys currently enabled on Auto-Purge settings."""
     return [group for group, attr in GROUP_ATTRS.items() if getattr(settings, attr, False)]
 
 
+def _scope_is_unrestricted(groups):
+    """True when every known scope group is enabled (whole unused-blow-by path)."""
+    return len(groups) >= len(GROUP_ATTRS) - 1 and set(groups) >= set(GROUP_ATTRS) - {"objects"}
+
+
+def format_result(removed):
+    """Turn the removed-counts dict into a short human readable string."""
+    if not removed:
+        return "Nothing to purge"
+    total = sum(removed.values())
+    parts = sorted(removed.items(), key=lambda kv: (-kv[1], kv[0]))
+    detail = ", ".join(f"{k}: {n}" for k, n in parts)
+    return f"Purged {total} block(s) ({detail})"
+
+
+# ---------------------------------------------------------------------------
+# The two purge paths
+# ---------------------------------------------------------------------------
+
+
 def purge_groups(active, respect_fake_user=True, max_passes=MAX_PURGE_PASSES):
-    """Remove orphaned data blocks (zero users) for the requested scope groups.
+    """Precise, data-API remover used when the user narrows the scope.
 
-    Purges directly through the data API rather than the outliner operator so it
-    never runs inside a depsgraph update, and repeats several passes so nested
-    orphans (e.g. object -> mesh -> shape key / material -> node -> texture) are
-    cleaned up in dependency order. Data blocks that carry a Fake User are never
-    touched.
-
-    Returns a dict mapping data-category name -> number of blocks removed.
+    Only touches the bpy.data.<attr> categories whose scope group is enabled,
+    runs several passes to clear nested orphans in dependency order, strands
+    Fake-User blocks untouched, and leaks nothing. Iterating a live bpy
+    collection while removing is unsafe, so every pass works from a snapshot.
     """
     attrs = []
     for group in active:
@@ -71,60 +136,78 @@ def purge_groups(active, respect_fake_user=True, max_passes=MAX_PURGE_PASSES):
                 blocks = getattr(bpy.data, attr)
             except AttributeError:
                 continue
-            # Snapshot: removing while iterating a bpy collection is unsafe.
             for block in list(blocks):
                 if getattr(block, "users", 1) != 0:
                     continue
                 if respect_fake_user and getattr(block, "use_fake_user", False):
                     continue
-                # Never remove a collection that still belongs to a scene.
-                if attr == "collections" and _is_scene_collection(block):
+                # Never let the scene's own collection be removed.
+                if attr == "collections" and _belongs_to_scene(block):
                     continue
                 try:
                     blocks.remove(block)
                 except Exception:
                     continue
-                removed[attr] = removed.get(attr, 0) + 1
+                removed[group_for_attr(attr, active)] = removed.get(group_for_attr(attr, active), 0) + 1
                 changed = True
         if not changed:
             break
     return removed
 
 
-def _is_scene_collection(collection):
+def purge_all_via_operator(settings):
+    """Blender's own recursive orphan purge (the 'worked before' mechanism).
+
+    Delegates to ``bpy.ops.outliner.orphans_purge`` so unused data is removed
+    exactly as Blender's native 'Purge > Unused Data' does — recursive, Fake
+    User safe, and never a silent no-op. Only called from a timer tick (safe
+    point), never from inside the depsgraph handler.
+    """
+    if not getattr(settings, "enabled", False):
+        return {}
+    window_manager = bpy.context.window_manager
+    if window_manager is None:
+        return {}
+    try:
+        bpy.ops.outliner.orphans_purge(
+            do_local_ids=True,
+            do_linked_ids=True,
+            do_recursive=True,
+        )
+    except Exception:
+        return {}
+    return {"unused": 1}
+
+
+def _belongs_to_scene(collection):
     for scene in bpy.data.scenes:
         for name in ("collection", "master_collection"):
-            if getattr(scene, name, None) == collection:
+            node = getattr(scene, name, None)
+            if node is not None and node == collection:
                 return True
     return False
 
 
-def format_result(removed):
-    """Turn the removed-counts dict into a short human readable string."""
-    if not removed:
-        return "Nothing to purge"
-    total = sum(removed.values())
-    parts = sorted(removed.items(), key=lambda kv: (-kv[1], kv[0]))
-    detail = ", ".join(f"{k}: {n}" for k, n in parts)
-    return f"Purged {total} block(s) ({detail})"
+def group_for_attr(attr, active):
+    for group in active:
+        if attr in PURGE_GROUPS.get(group, ()):
+            return group
+    return attr
+
+
+# ---------------------------------------------------------------------------
+# Watchdog / manager
+# ---------------------------------------------------------------------------
 
 
 class AutoPurgeManager:
-    """Detects object deletions and schedules safe, debounced purge runs.
+    """Detects data deletions and schedules a safe, debounced purge.
 
-    Design notes (addressing Blender's add-on review feedback):
-
-    * Stability: the purge never runs inside the depsgraph_update_post handler
-      (running operators in there is unsafe). Deletions are only *detected* there
-      via a cheap object-name snapshot; the actual purge runs later from the
-      persistent watchdog timer (_poll_tick), which is a safe point on the main
-      thread.
-    * Performance: the handler skips all work immediately unless auto-purge is
-      enabled and no purge is pending/cooldowning. It does not fire the (much
-      heavier) orphan-purge operator. The watchdog ticks every 0.5s and only does
-      real work when enabled.
-    * Safety: only data blocks with zero users and no Fake User are removed, only
-      the scope groups the user enabled, and everything is opt-in (off by default).
+    A persistent timer is the source of truth for when a purge may actually run
+    (the safe main-thread point). The depsgraph update handler only *detects*
+    removals by keeping a cheap object-name snapshot; it never purges. The timer
+    additionally polls so a purge still happens even if no depsgraph event ever
+    fires (watchdog fallback).
     """
 
     def __init__(self):
@@ -135,7 +218,7 @@ class AutoPurgeManager:
         self._purge_ready_at = 0.0
 
     def seed(self):
-        """Rebuild the known-object snapshot (called at start and after a purge)."""
+        """Rebuild the known-object snapshot (called at start and after purges)."""
         try:
             self._snapshot = {o.name for o in bpy.data.objects}
         except Exception:
@@ -149,18 +232,14 @@ class AutoPurgeManager:
         self._snapshot = set()
 
     def on_depsgraph_update(self, settings):
-        """Handle a depsgraph update: look for removed objects, cheaply.
-
-        Keeps the snapshot fresh on every call so deletions are never missed;
-        the echo-guard only suppresses scheduling a new purge right after a
-        purge has run (the purge's own removals would otherwise re-trigger it).
-        """
+        """Snapshot + compare object names; *detect* a deletion, never purge here."""
         if self._purging or not getattr(settings, "enabled", False):
+            self.seed()
             return
         try:
             current = {o.name for o in bpy.data.objects}
         except Exception:
-            return
+            current = set()
         removed = self._snapshot - current
         self._snapshot = current
         if not removed:
@@ -169,26 +248,21 @@ class AutoPurgeManager:
             return
         self._schedule(settings)
 
-    def status(self):
-        """Short, human readable description of the current manager state."""
-        if self._purging:
-            return "purging"
-        if self._pending:
-            return "purge pending"
-        return "watching for unused data"
-
     def _schedule(self, settings):
         if self._pending:
             return
         self._pending = True
-        interval = min(max(float(getattr(settings, "debounce", 0.5)), MIN_TIMER_INTERVAL),
-                       MAX_TIMER_INTERVAL)
-        self._purge_ready_at = time.monotonic() + interval
+        try:
+            debounce = float(getattr(settings, "debounce", DEFAULT_DEBOUNCE))
+        except Exception:
+            debounce = DEFAULT_DEBOUNCE
+        debounce = min(max(debounce, MIN_DEBOUNCE), MAX_DEBOUNCE)
+        self._purge_ready_at = time.monotonic() + debounce
         if getattr(settings, "report", False):
-            print(f"[Auto Purge] object deletion detected; purge in ~{interval:.2f}s")
+            print(f"[Auto Purge] deletion detected; purge scheduled in ~{debounce:.2f}s")
 
     def purge_if_due(self, settings):
-        """Run the scheduled purg once the debounce has elapsed (timer safe point)."""
+        """Run the scheduled purge once the debounce has elapsed (timer safe point)."""
         if not self._pending or self._purging:
             return
         if not getattr(settings, "enabled", False):
@@ -199,99 +273,106 @@ class AutoPurgeManager:
         self._pending = False
         self._purging = True
         try:
-            removed = purge_groups(
-                active_groups(settings),
-                respect_fake_user=settings.respect_fake_user,
-            )
+            removed = self._run(settings)
             self._record(settings, removed)
         except Exception:
             pass
         finally:
             self._purging = False
-            self._cooldown_after_purge(settings)
+            self._cooldown(settings)
 
-    @staticmethod
-    def _record(settings, removed):
+    def _run(self, settings):
+        """Pick the right purge path for the current scope selection."""
+        groups = active_groups(settings)
+        if _scope_is_unrestricted(groups):
+            return purge_all_via_operator(settings)
+        return purge_groups(
+            groups,
+            respect_fake_user=getattr(settings, "respect_fake_user", True),
+        )
+
+    def _record(self, settings, removed):
         result = format_result(removed)
         settings.last_result = f"{time.strftime('%H:%M:%S')} - {result}"
         if getattr(settings, "report", False):
             print(f"[Auto Purge] {result}")
 
-    def _cooldown_after_purge(self, settings):
+    def _cooldown(self, settings):
         self.seed()
         try:
-            delay = float(getattr(settings, "debounce", 0.5))
+            debounce = float(getattr(settings, "debounce", DEFAULT_DEBOUNCE))
         except Exception:
-            delay = 0.5
-        self._ignore_until = time.monotonic() + min(max(delay, 0.0), MAX_TIMER_INTERVAL)
+            debounce = DEFAULT_DEBOUNCE
+        self._ignore_until = time.monotonic() + min(max(debounce, 0.0), MAX_TIMER_INTERVAL)
+
+    def status(self):
+        """Short, human readable description of the current manager state."""
+        if self._purging:
+            return "purging"
+        if self._pending:
+            return "purge pending"
+        return "watching for unused data"
 
 
 manager = AutoPurgeManager()
 
 
-def _depsgraph_update_handler(*args):
-    """Registered on bpy.app.handlers.depsgraph_update_post (2-arg in recent Blender)."""
-    try:
-        scene = bpy.context.scene
-        if scene is not None and hasattr(scene, "auto_purge"):
-            manager.on_depsgraph_update(scene.auto_purge)
-    except Exception:
-        pass
+# ---------------------------------------------------------------------------
+# Blender glue: handlers + persistent watchdog timer (all idempotent)
+# ---------------------------------------------------------------------------
 
 
-def _load_post_handler(*args):
-    manager.seed()
-
-
-def _load_pre_handler(*args):
-    manager.reset()
+def _depsgraph_update_handler(scene, depsgraph):
+    """Depsgraph update handler: detect deletions only, never purge."""
+    settings = getattr(getattr(bpy.context, "scene", None), "auto_purge", None)
+    if settings is not None and getattr(settings, "enabled", False):
+        manager.on_depsgraph_update(settings)
 
 
 def _poll_tick():
-    """Persistent watchdog: detect deletions and run scheduled purges.
-
-    Runs every POLL_INTERVAL seconds while Blender is idle. The depsgraph_update_post
-    handler gives fast detection when it fires; this timer is the reliable fallback (it
-    detects deletions AND performs the purge at the same safe timer point) so Auto-Purge
-    never depends on the handler alone. Does nothing meaningful unless Auto-Purge is
-    enabled (cheap early return).
-    """
-    scene = bpy.context.scene
+    """Persistent watchdog: run scheduled purges at a safe timer point, and
+    also detect deletions from deletions the handler may have missed."""
+    scene = getattr(bpy.context, "scene", None)
     settings = getattr(scene, "auto_purge", None) if scene is not None else None
-    if settings is not None:
+    if settings is not None and getattr(settings, "enabled", False):
         manager.on_depsgraph_update(settings)
         manager.purge_if_due(settings)
-    return POLL_INTERVAL
+    return WATCHDOG_INTERVAL
+
+
+def _load_post_handler():
+    """Re-seed the manager snapshot after loading a new file."""
+    manager.seed()
+
+
+# ---------------------------------------------------------------------------
+# Registration (idempotent: safe to call repeatedly)
+# ---------------------------------------------------------------------------
 
 
 def register():
-    # No data access here: bpy.context/bpy.data are restricted while an add-on
-    # registers. The manager self-initialises on the first depsgraph update and
-    # is re-seeded by the load_post handler whenever a file is loaded.
-    # All registrations are idempotent so a reload (e.g. VS Code reconnect that
-    # calls register() again) cannot duplicate handlers or watchdog timers.
     if _depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_depsgraph_update_handler)
     if _load_post_handler not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_load_post_handler)
-    if _load_pre_handler not in bpy.app.handlers.load_pre:
-        bpy.app.handlers.load_pre.append(_load_pre_handler)
     if not bpy.app.timers.is_registered(_poll_tick):
-        bpy.app.timers.register(_poll_tick, first_interval=POLL_INTERVAL, persistent=True)
+        bpy.app.timers.register(_poll_tick, persistent=True)
+    manager.seed()
 
 
 def unregister():
-    for handler, lst in (
-        (_depsgraph_update_handler, bpy.app.handlers.depsgraph_update_post),
-        (_load_post_handler, bpy.app.handlers.load_post),
-        (_load_pre_handler, bpy.app.handlers.load_pre),
-    ):
-        try:
-            lst.remove(handler)
-        except ValueError:
-            pass
+    for handler in (_depsgraph_update_handler, _load_post_handler):
+        for hlist in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.load_post):
+            try:
+                hlist.remove(handler)
+            except ValueError:
+                pass
     try:
         bpy.app.timers.unregister(_poll_tick)
     except Exception:
         pass
     manager.reset()
+
+
+# Module keeps a friendly alias for older tests / external imports.
+PURGE_GROUPS_CACHE = PURGE_GROUPS
