@@ -1,6 +1,6 @@
 import bpy
 
-from ..funcs.purge import active_groups, format_result, manager, purge_groups
+from ..funcs.purge import ADDON_VERSION_STRING, active_groups, format_result, manager, purge_groups
 
 
 def _icon(name):

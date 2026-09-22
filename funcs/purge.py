@@ -33,7 +33,12 @@ GROUP_ATTRS = {
 MAX_PURGE_PASSES = 10
 MIN_TIMER_INTERVAL = 0.05
 MAX_TIMER_INTERVAL = 5.0
+
+# Full add-on version, so the UI can label builds without importing Blender data.
+ADDON_VERSION_STRING = "1.1.1"
 POLL_INTERVAL = 0.5
+
+# Matches bl_info["version"] in the root __init__.py (kept in sync manually).
 
 
 def active_groups(settings):
