@@ -1,10 +1,15 @@
 """UI panel + manual-purge operator for Auto-Purge.
 
 The draw method is engineered to be impossible to crash with a NameError from
-cross-module imports: the version label and manager status come from module-local
-helpers that import lazily and fall back gracefully, so even if a cross-module
-import failed the panel would still draw. Anything that raises inside Blender's
-PROPERTIES editor kills the whole panel, so draw() is kept deliberately defensive.
+cross-module imports: the manager status comes from a module-local helper that
+imports lazily and falls back gracefully, so even if a cross-module import
+failed the panel would still draw. Anything that raises inside Blender's
+PROPERTIES editor kills the whole panel, so draw() is kept deliberately
+defensive.
+
+Layout: the parent panel always shows the Enable toggle and "Purge Now"
+button, with the scope, security, and history sections as foldable
+sub-panels underneath.
 """
 
 import bpy
@@ -55,24 +60,14 @@ def _scene_settings(context):
     return getattr(scene, "auto_purge", None)
 
 
-def _version_label():
-    """Return the add-on version string, preferring the module source of truth."""
-    try:
-        from ..funcs.purge import ADDON_VERSION_STRING
-
-        return ADDON_VERSION_STRING
-    except Exception:
-        return "0.0.0"
-
-
-def _manager_text():
-    """Return 'vX.Y.Z - status' for the panel header, never raising."""
+def _status_text():
+    """Return the watchdog status for the history section, never raising."""
     from ..funcs.purge import manager  # inside call -> import errors are local
 
     try:
-        return f"v{_version_label()} - {manager.status()}"
+        return manager.status()
     except Exception:
-        return f"v{_version_label()} - watching for unused data"
+        return "Watching for unused data"
 
 
 # ---------------------------------------------------------------------------
@@ -131,10 +126,27 @@ class AUTO_PURGE_PT_panel(bpy.types.Panel):
         row.prop(settings, "enabled", text="Enable Auto-Purge", toggle=True)
         row.operator("scene.auto_purge_now", text="Purge Now", icon=_icon("TRASH"))
 
-        self.layout.label(text=_manager_text(), icon=_icon("INFO"))
 
-        box = self.layout.box()
-        col = box.column(align=True)
+class AUTO_PURGE_PT_scope(bpy.types.Panel):
+    """Scope section: the data categories Auto-Purge may remove."""
+
+    bl_label = "What to Remove"
+    bl_idname = "AUTO_PURGE_PT_scope"
+    bl_parent_id = "AUTO_PURGE_PT_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "scene"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return _scene_settings(context) is not None
+
+    def draw(self, context):
+        settings = _scene_settings(context)
+        if settings is None:
+            return
+        col = self.layout.column(align=True)
         col.prop(settings, "purge_objects", text="Objects")
         col.prop(settings, "purge_geometry", text="Geometry (mesh/curve/etc.)")
         col.prop(settings, "purge_materials", text="Materials")
@@ -142,18 +154,66 @@ class AUTO_PURGE_PT_panel(bpy.types.Panel):
         col.prop(settings, "purge_images", text="Images")
         col.prop(settings, "purge_misc", text="Misc")
 
-        box = self.layout.box()
-        box.label(text="Safety", icon=_icon("FAKE_USER_ON"))
-        col = box.column(align=True)
+
+class AUTO_PURGE_PT_security(bpy.types.Panel):
+    """Security section: guards that keep purging safe."""
+
+    bl_label = "Security"
+    bl_idname = "AUTO_PURGE_PT_security"
+    bl_parent_id = "AUTO_PURGE_PT_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "scene"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return _scene_settings(context) is not None
+
+    def draw(self, context):
+        settings = _scene_settings(context)
+        if settings is None:
+            return
+        col = self.layout.column(align=True)
         col.prop(settings, "respect_fake_user")
         col.prop(settings, "debounce")
         col.prop(settings, "report")
 
-        if getattr(settings, "last_result", ""):
-            self.layout.label(text=str(settings.last_result), icon=_icon("INFO"))
+
+class AUTO_PURGE_PT_progress(bpy.types.Panel):
+    """Progress section: live watchdog status and the purge history log."""
+
+    bl_label = "Progress & History"
+    bl_idname = "AUTO_PURGE_PT_progress"
+    bl_parent_id = "AUTO_PURGE_PT_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "scene"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return _scene_settings(context) is not None
+
+    def draw(self, context):
+        settings = _scene_settings(context)
+        if settings is None:
+            return
+        col = self.layout.column(align=True)
+        col.label(text=_status_text(), icon=_icon("INFO"))
+        history = getattr(settings, "history", None)
+        if history is None or not len(history):
+            col.label(text="No purges yet", icon=_icon("INFO"))
+            return
+        for entry in history:
+            text = str(entry.text)
+            col.label(text=f"{entry.time} - {text}")
 
 
 classes = (
     AUTO_PURGE_OT_purge_now,
     AUTO_PURGE_PT_panel,
+    AUTO_PURGE_PT_scope,
+    AUTO_PURGE_PT_security,
+    AUTO_PURGE_PT_progress,
 )

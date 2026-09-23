@@ -1,9 +1,15 @@
 import bpy
 
 from .funcs import purge
-from .funcs.properties import AUTO_PURGE_PG_scene
+from .funcs.properties import AUTO_PURGE_PG_history_entry, AUTO_PURGE_PG_scene
 from .funcs.purge import ADDON_VERSION_TUPLE
-from .UI.panel import AUTO_PURGE_PT_panel, AUTO_PURGE_OT_purge_now
+from .UI.panel import (
+    AUTO_PURGE_PT_panel,
+    AUTO_PURGE_PT_scope,
+    AUTO_PURGE_PT_security,
+    AUTO_PURGE_PT_progress,
+    AUTO_PURGE_OT_purge_now,
+)
 
 bl_info = {
     "name": "Auto Purge",
@@ -17,9 +23,13 @@ bl_info = {
 }
 
 classes = (
+    AUTO_PURGE_PG_history_entry,
     AUTO_PURGE_PG_scene,
     AUTO_PURGE_OT_purge_now,
     AUTO_PURGE_PT_panel,
+    AUTO_PURGE_PT_scope,
+    AUTO_PURGE_PT_security,
+    AUTO_PURGE_PT_progress,
 )
 
 

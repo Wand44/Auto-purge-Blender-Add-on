@@ -1,6 +1,19 @@
 import bpy
 
 
+class AUTO_PURGE_PG_history_entry(bpy.types.PropertyGroup):
+    """One line in the purge history log."""
+
+    time: bpy.props.StringProperty(
+        name="Time",
+        default="",
+    )
+    text: bpy.props.StringProperty(
+        name="Text",
+        default="",
+    )
+
+
 class AUTO_PURGE_PG_scene(bpy.types.PropertyGroup):
     """Per-scene settings for the Auto-Purge add-on."""
 
@@ -61,8 +74,8 @@ class AUTO_PURGE_PG_scene(bpy.types.PropertyGroup):
         description="Print a summary of removed data blocks to the status bar / console",
         default=True,
     )
-    last_result: bpy.props.StringProperty(
-        name="Last Result",
-        description="Summary of the last purge run",
-        default="",
+    history: bpy.props.CollectionProperty(
+        name="History",
+        description="Chronological log of recent purge runs",
+        type=AUTO_PURGE_PG_history_entry,
     )

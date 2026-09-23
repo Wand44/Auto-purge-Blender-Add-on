@@ -33,21 +33,25 @@ and it only ever removes data that has zero users (and no Fake User).
    off by default on purpose.
 3. Delete an object as you normally would. A short moment later the orphaned
    data (objects, meshes, materials, images, …) is removed.
-4. The panel shows the result of the last run, for example:
+4. Open the **Progress & History** section to watch what happened. Every purge
+   that actually removed something leaves a timestamped log line, for example:
 
    ```
-   Purged 4 block(s) (meshes: 2, materials: 1, images: 1)
+   14:03:21 - Purged 4 block(s) (meshes: 2, materials: 1, images: 1)
+   14:02:54 - Purged 1 block(s) (objects: 1)
    ```
 
-   When there was nothing to clean up: `Nothing to purge`.
+The rest of the panel is organized into foldable sections - **What to
+Remove**, **Security**, and **Progress & History** - so the top of the panel
+stays minimal and every section can be collapsed when you do not need it.
 
 Use **Purge Now** at the top of the panel to run the exact same cleanup
 manually, any time.
 
-## Scope
+## What to Remove
 
-The **Scope** options decide which kinds of data blocks the add-on may remove.
-Only the enabled categories are ever touched.
+The **What to Remove** options decide which kinds of data blocks the add-on
+may remove. Only the enabled categories are ever touched.
 
 | Option    | Covers                                                          | Default |
 |-----------|-----------------------------------------------------------------|---------|
@@ -61,9 +65,9 @@ Only the enabled categories are ever touched.
 Because the scope is stored per scene, different scenes in the same file can use
 different settings.
 
-## Safety
+## Security
 
-The **Safety** section is what makes Auto Purge safe to leave running.
+The **Security** section is what makes Auto Purge safe to leave running.
 
 * **Respect Fake User** (default on): data with Fake User enabled (the shield
   icon in the Outliner) is never touched. Set Fake User on anything you want to

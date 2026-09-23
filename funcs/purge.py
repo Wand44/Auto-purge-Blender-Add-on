@@ -32,8 +32,8 @@ import bpy
 # ---------------------------------------------------------------------------
 # Version (single source of truth)
 # ---------------------------------------------------------------------------
-# Imported by the root __init__.py (bl_info) and the UI panel (version label).
-# blender_manifest.toml mirrors this string for the extension platform.
+# Imported by the root __init__.py (bl_info). blender_manifest.toml mirrors
+# this string for the extension platform.
 ADDON_VERSION_STRING = "1.1.2"
 ADDON_VERSION_TUPLE = (1, 1, 2)
 
@@ -46,6 +46,7 @@ DEFAULT_DEBOUNCE = 0.5
 WATCHDOG_INTERVAL = 0.5          # watchdog poll period (timer seconds)
 MAX_TIMER_INTERVAL = 5.0
 MAX_PURGE_PASSES = 10
+MAX_HISTORY = 10
 
 # ---------------------------------------------------------------------------
 # Scope groups
@@ -58,12 +59,7 @@ PURGE_GROUPS = {
     "objects": ("objects",),
     "geometry": (
         "meshes", "curves", "surfaces", "lattices", "armatures",
-     Now review the staged changes before committing:
-$ git status && echo "===DIFF-FUNC===" && git diff --stat && echo "===GITIGNORE===" && cat .gitignore
-On branch main
-Your branch is ahead of 'origin/main' by 4 commits.
-  (use "git push" to publish your local commits)
-   "metaballs", "volumes", "grease_pencils", "hair_curves",
+        "metaballs", "volumes", "grease_pencils", "hair_curves",
         "pointclouds", "shape_keys",
     ),
     "materials": ("materials", "node_groups"),
@@ -260,9 +256,14 @@ def run_purge(settings):
 
 
 def record_result(settings, removed):
-    """Persist and optionally print a human readable summary of a purge run."""
+    """Append a timestamped summary of a purge run to the history log."""
     result = format_result(removed)
-    settings.last_result = f"{time.strftime('%H:%M:%S')} - {result}"
+    if removed:
+        entry = settings.history.add()
+        entry.time = time.strftime("%H:%M:%S")
+        entry.text = result
+        while len(settings.history) > MAX_HISTORY:
+            settings.history.remove(0)
     if getattr(settings, "report", False):
         print(f"[Auto Purge] {result}")
 
@@ -381,10 +382,10 @@ class AutoPurgeManager:
     def status(self):
         """Short, human readable description of the current manager state."""
         if self._purging:
-            return "purging"
+            return "Purging"
         if self._pending:
-            return "purge pending"
-        return "watching for unused data"
+            return "Purge pending"
+        return "Watching for unused data"
 
 
 manager = AutoPurgeManager()
