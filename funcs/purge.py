@@ -58,7 +58,12 @@ PURGE_GROUPS = {
     "objects": ("objects",),
     "geometry": (
         "meshes", "curves", "surfaces", "lattices", "armatures",
-        "metaballs", "volumes", "grease_pencils", "hair_curves",
+     Now review the staged changes before committing:
+$ git status && echo "===DIFF-FUNC===" && git diff --stat && echo "===GITIGNORE===" && cat .gitignore
+On branch main
+Your branch is ahead of 'origin/main' by 4 commits.
+  (use "git push" to publish your local commits)
+   "metaballs", "volumes", "grease_pencils", "hair_curves",
         "pointclouds", "shape_keys",
     ),
     "materials": ("materials", "node_groups"),
