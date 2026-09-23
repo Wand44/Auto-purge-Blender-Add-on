@@ -14,13 +14,13 @@ retaining every security feature added for review feedback):
   *detected* there via a cheap object-name snapshot + a persistent watchdog
   timer; the operator runs later, on the main thread, from the timer tick after
   a debounce.
-* Scope groups still apply: when every category under a scope group is enabled
-  the add-on takes the reliable orphan-purge operator path (which purges all
-  unused categories); when the user explicitly disables categories, the purge
-  falls back to the precise per-attribute data-API remover so the scope choice
-  is respected exactly.
+* Scope groups still apply: when **every** scope category is enabled the add-on
+  takes the reliable orphan-purge operator path (which purges all unused
+  categories); when the user disables any category, the purge falls back to the
+  precise per-attribute data-API remover so the scope choice is respected
+  exactly.
 * Fake User is always respected (both paths guard ``use_fake_user``); respect
-  for Fake User can additionally be toggled by the user.
+  for Fake User can additionally be toggled by the user (in the precise path).
 * Everything in this module is idempotent: register/unregister may be called
   any number of times without leaking handlers, timers or duplicate callbacks.
 """
@@ -30,10 +30,10 @@ import time
 import bpy
 
 # ---------------------------------------------------------------------------
-# Version (single definition; exported for the version label)
+# Version (single source of truth)
 # ---------------------------------------------------------------------------
-# Matches bl_info["version"] in the root __init__.py and blender_manifest.toml.
-# Kept exactly once, at module scope, so an import can bind it unconditionally.
+# Imported by the root __init__.py (bl_info) and the UI panel (version label).
+# blender_manifest.toml mirrors this string for the extension platform.
 ADDON_VERSION_STRING = "1.1.2"
 ADDON_VERSION_TUPLE = (1, 1, 2)
 
@@ -44,8 +44,8 @@ MIN_DEBOUNCE = 0.1
 MAX_DEBOUNCE = 5.0
 DEFAULT_DEBOUNCE = 0.5
 WATCHDOG_INTERVAL = 0.5          # watchdog poll period (timer seconds)
-MAX_OPERATOR_RETRIES = 3
-ORPHANS_OR_FLAG_MISSING = ()     # replaced at registration from live manifest
+MAX_TIMER_INTERVAL = 5.0
+MAX_PURGE_PASSES = 10
 
 # ---------------------------------------------------------------------------
 # Scope groups
@@ -80,28 +80,23 @@ GROUP_ATTRS = {
     "misc": "purge_misc",
 }
 
-MAX_PURGE_PASSES = 10
-MIN_TIMER_INTERVAL = 0.05
-MAX_TIMER_INTERVAL = 5.0
-
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 
 
-def has_orphans_in_scope(settings):
-    """True when the *enabled scope* currently holds a purgeable zero-user block.
+def count_orphans_in_scope(settings):
+    """Per-category counts of purgeable zero-user blocks in the enabled scope.
 
     Replicates the scope gating used by :func:`purge_groups` (active groups,
-    their mapped data attrs, and the Fake User respect flag) so detection is
-    always consistent with what a real purge would actually remove. Only ever
-    called from the watchdog tick — it only *schedules*, never purges here.
+    their mapped data attrs, the Fake User respect flag and the scene-collection
+    guard) so detection is always consistent with what a real purge would
+    actually remove. Used by the watchdog probe and to measure operator-path
+    purges accurately.
     """
-    try:
-        groups = active_groups(settings)
-    except Exception:
-        return False
+    groups = active_groups(settings)
     respect_fake_user = bool(getattr(settings, "respect_fake_user", True))
+    counts = {}
     for group in groups:
         for attr in PURGE_GROUPS.get(group, ()):
             try:
@@ -114,10 +109,20 @@ def has_orphans_in_scope(settings):
                         continue
                     if respect_fake_user and block.use_fake_user:
                         continue
+                    if attr == "collections" and _belongs_to_scene(block):
+                        continue
                 except Exception:
                     continue
-                return True
-    return False
+                counts[group] = counts.get(group, 0) + 1
+    return counts
+
+
+def has_orphans_in_scope(settings):
+    """True when the *enabled scope* currently holds a purgeable zero-user block.
+
+    Only ever called from the watchdog tick — it only *schedules*, never purges.
+    """
+    return any(count_orphans_in_scope(settings).values())
 
 
 def active_groups(settings):
@@ -126,8 +131,8 @@ def active_groups(settings):
 
 
 def _scope_is_unrestricted(groups):
-    """True when every known scope group is enabled (whole unused-blow-by path)."""
-    return len(groups) >= len(GROUP_ATTRS) - 1 and set(groups) >= set(GROUP_ATTRS) - {"objects"}
+    """True when every known scope group is enabled (Blender's own purge path)."""
+    return set(groups) >= set(GROUP_ATTRS)
 
 
 def format_result(removed):
@@ -163,6 +168,7 @@ def purge_groups(active, respect_fake_user=True, max_passes=MAX_PURGE_PASSES):
     for _ in range(max_passes):
         changed = False
         for attr in attrs:
+            group = group_for_attr(attr, active)
             try:
                 blocks = getattr(bpy.data, attr)
             except AttributeError:
@@ -179,7 +185,7 @@ def purge_groups(active, respect_fake_user=True, max_passes=MAX_PURGE_PASSES):
                     blocks.remove(block)
                 except Exception:
                     continue
-                removed[group_for_attr(attr, active)] = removed.get(group_for_attr(attr, active), 0) + 1
+                removed[group] = removed.get(group, 0) + 1
                 changed = True
         if not changed:
             break
@@ -191,13 +197,17 @@ def purge_all_via_operator(settings):
 
     Delegates to ``bpy.ops.outliner.orphans_purge`` so unused data is removed
     exactly as Blender's native 'Purge > Unused Data' does — recursive, Fake
-    User safe, and never a silent no-op. Only called from a timer tick (safe
-    point), never from inside the depsgraph handler.
+    User safe, and never a silent no-op. Only called from a safe main-thread
+    point (a timer tick, or the manual "Purge Now" operator), never from inside
+    the depsgraph handler. Removed counts are measured by diffing the enabled
+    scope before and after, so the report is accurate.
     """
     if not getattr(settings, "enabled", False):
         return {}
-    window_manager = bpy.context.window_manager
-    if window_manager is None:
+    if bpy.context.window_manager is None:
+        return {}
+    before = count_orphans_in_scope(settings)
+    if not before:
         return {}
     try:
         bpy.ops.outliner.orphans_purge(
@@ -207,7 +217,49 @@ def purge_all_via_operator(settings):
         )
     except Exception:
         return {}
-    return {"unused": 1}
+    after = count_orphans_in_scope(settings)
+    removed = {}
+    for group, count in before.items():
+        diff = count - after.get(group, 0)
+        if diff > 0:
+            removed[group] = diff
+    return removed
+
+
+def group_for_attr(attr, active):
+    for group in active:
+        if attr in PURGE_GROUPS.get(group, ()):
+            return group
+    return attr
+
+
+# ---------------------------------------------------------------------------
+# Shared purge entry points
+# ---------------------------------------------------------------------------
+
+
+def run_purge(settings):
+    """Remove unused data for the current scope; return per-category counts.
+
+    Uses Blender's own orphan-purge operator when the scope is fully open,
+    otherwise the precise per-category remover. Safe to call from a timer tick
+    or from the manual "Purge Now" operator.
+    """
+    groups = active_groups(settings)
+    if _scope_is_unrestricted(groups):
+        return purge_all_via_operator(settings)
+    return purge_groups(
+        groups,
+        respect_fake_user=getattr(settings, "respect_fake_user", True),
+    )
+
+
+def record_result(settings, removed):
+    """Persist and optionally print a human readable summary of a purge run."""
+    result = format_result(removed)
+    settings.last_result = f"{time.strftime('%H:%M:%S')} - {result}"
+    if getattr(settings, "report", False):
+        print(f"[Auto Purge] {result}")
 
 
 def _belongs_to_scene(collection):
@@ -217,13 +269,6 @@ def _belongs_to_scene(collection):
             if node is not None and node == collection:
                 return True
     return False
-
-
-def group_for_attr(attr, active):
-    for group in active:
-        if attr in PURGE_GROUPS.get(group, ()):
-            return group
-    return attr
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +327,7 @@ class AutoPurgeManager:
     def schedule_debounced(self, settings):
         """Public, pure-scheduling wrapper used by the watchdog tick.
 
-        Runs on the timer thread (the single safe point a purge may ever be
+        Runs on the timer tick (the single safe point a purge may ever be
         scheduled from); applies the same debounce/_pending gate as the
         object-deletion detection path, so scheduling here is never more
         aggressive than scheduling from a deletion. Does not purge."""
@@ -313,29 +358,12 @@ class AutoPurgeManager:
         self._pending = False
         self._purging = True
         try:
-            removed = self._run(settings)
-            self._record(settings, removed)
+            record_result(settings, run_purge(settings))
         except Exception:
             pass
         finally:
             self._purging = False
             self._cooldown(settings)
-
-    def _run(self, settings):
-        """Pick the right purge path for the current scope selection."""
-        groups = active_groups(settings)
-        if _scope_is_unrestricted(groups):
-            return purge_all_via_operator(settings)
-        return purge_groups(
-            groups,
-            respect_fake_user=getattr(settings, "respect_fake_user", True),
-        )
-
-    def _record(self, settings, removed):
-        result = format_result(removed)
-        settings.last_result = f"{time.strftime('%H:%M:%S')} - {result}"
-        if getattr(settings, "report", False):
-            print(f"[Auto Purge] {result}")
 
     def _cooldown(self, settings):
         self.seed()
@@ -382,8 +410,13 @@ def _poll_tick():
     return WATCHDOG_INTERVAL
 
 
-def _load_post_handler():
-    """Re-seed the manager snapshot after loading a new file."""
+def _load_post_handler(*args):
+    """Re-seed the manager snapshot after loading a new file.
+
+    Accepts the filepath argument Blender passes to ``load_post`` (and ignores
+    it); ``*args`` keeps this compatible across Blender versions that vary the
+    exact call signature.
+    """
     manager.seed()
 
 
@@ -414,7 +447,3 @@ def unregister():
     except Exception:
         pass
     manager.reset()
-
-
-# Module keeps a friendly alias for older tests / external imports.
-PURGE_GROUPS_CACHE = PURGE_GROUPS

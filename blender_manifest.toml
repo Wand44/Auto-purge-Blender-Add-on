@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "Auto_Purge"
-version = "1.1.1"
+version = "1.1.2"
 name = "Auto Purge"
 tagline = "Safely remove orphaned data after object deletion"
 maintainer = "BlenderFace"
