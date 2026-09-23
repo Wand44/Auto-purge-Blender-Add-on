@@ -30,14 +30,6 @@ import time
 import bpy
 
 # ---------------------------------------------------------------------------
-# Version (single source of truth)
-# ---------------------------------------------------------------------------
-# Imported by the root __init__.py (bl_info). blender_manifest.toml mirrors
-# this string for the extension platform.
-ADDON_VERSION_STRING = "1.1.2"
-ADDON_VERSION_TUPLE = (1, 1, 2)
-
-# ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
 MIN_DEBOUNCE = 0.1

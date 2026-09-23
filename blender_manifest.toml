@@ -7,7 +7,7 @@ tagline = "Safely remove orphaned data after object deletion"
 maintainer = "BlenderFace"
 type = "add-on"
 
-tags = ["Scene", "Utilities"]
+tags = ["Scene", "System"]
 
 blender_version_min = "4.2.0"
 blender_version_max = "5.5.0"
